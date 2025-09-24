@@ -1,28 +1,25 @@
 import os, ssl, socket
-from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from ftplib import FTP_TLS, error_perm
+from ftplib import FTP_TLS
 
-# ------------ Переменные окружения ------------
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "").strip()
 LOCAL_PATH = Path(os.getenv("LOCAL_PATH", "/data/ostatki.xlsx"))
+
 HOST     = os.getenv("FTPS_HOST", "195.239.40.222")
 PORT     = int(os.getenv("FTPS_PORT", "19121"))
 USER     = os.getenv("FTPS_USER", "FTP_1C")
 PASSWORD = os.getenv("FTPS_PASSWORD", "W8JBV!H2RuzMwc64")
-REMOTE_DIR = os.getenv("FTPS_DIR", "/FTP_1C")
-MASK_EXT = tuple(e.strip() for e in os.getenv("MASK_EXT", ".xlsx,.ods").split(","))
+
+REMOTE_DIR  = os.getenv("FTPS_DIR", "/FTP_1C")
+REMOTE_FILE = os.getenv("FTPS_FILE", "Остатки чат-бот клиентский.xlsx")
 
 PASV = os.getenv("PASV", "true").lower() == "true"
 DISABLE_TLS_VERIFY = os.getenv("DISABLE_TLS_VERIFY", "true").lower() == "true"
-# ---------------------------------------------
 
 
 class FTPSessionReuse(FTP_TLS):
-    """FTP_TLS с повторным использованием TLS-сессии для data-соединений"""
     def ntransfercmd(self, cmd, rest=None):
-        size = None
         if self.passiveserver:
             host, port = self.makepasv()
             conn = socket.create_connection((host, port), self.timeout, self.source_address)
@@ -32,13 +29,12 @@ class FTPSessionReuse(FTP_TLS):
                     server_hostname=self.host,
                     session=getattr(self.sock, "session", None)
                 )
-            return conn, size
+            return conn, None
         else:
-            raise OSError("Active mode is not supported")
+            raise OSError("Active mode not supported")
 
 
 def connect_ftps():
-    # максимально совместимый SSL-контекст
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     try:
         ctx.minimum_version = ssl.TLSVersion.TLSv1
@@ -75,45 +71,12 @@ def connect_ftps():
     return ftps
 
 
-def list_files(ftps):
-    ftps.cwd(REMOTE_DIR)
-    files = []
-    try:
-        print("[FTPS] Trying MLSD…")
-        for name, facts in ftps.mlsd():
-            if facts.get("type") == "file" and name.endswith(MASK_EXT):
-                ts = facts.get("modify")
-                mtime = datetime.strptime(ts, "%Y%m%d%H%M%S") if ts else None
-                size = int(facts.get("size") or 0)
-                files.append({"name": name, "mtime": mtime, "size": size})
-        print(f"[FTPS] MLSD OK: {len(files)} files")
-    except Exception as e:
-        print(f"[FTPS] MLSD failed: {e}, fallback to NLST…")
-        try:
-            names = ftps.nlst()
-            for name in names:
-                if name.endswith(MASK_EXT):
-                    files.append({"name": name, "mtime": None, "size": None})
-            print(f"[FTPS] NLST OK: {len(files)} files")
-        except error_perm as e2:
-            raise RuntimeError(f"Failed to list files: {e2}")
-    return files
-
-
-def pick_latest(files):
-    return sorted(files,
-                  key=lambda x: (x["mtime"] is None,
-                                 x["mtime"] or datetime.min,
-                                 x["size"] or 0,
-                                 x["name"]),
-                  reverse=True)[0]["name"]
-
-
-def download(ftps, remote_name, local_path: Path):
+def download(ftps, remote_dir, remote_file, local_path: Path):
+    ftps.cwd(remote_dir)
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"[FTPS] RETR {remote_name} …")
+    print(f"[FTPS] RETR {remote_file} …")
     with NamedTemporaryFile("wb", delete=False, dir=str(local_path.parent)) as tmp:
-        ftps.retrbinary(f"RETR {remote_name}", tmp.write)
+        ftps.retrbinary(f"RETR {remote_file}", tmp.write)
         tmp_path = Path(tmp.name)
     tmp_path.replace(local_path)
     print(f"[FTPS] RETR OK → {local_path}")
@@ -134,12 +97,7 @@ def post_to_n8n(local_path: Path):
 def run():
     ftps = connect_ftps()
     try:
-        files = list_files(ftps)
-        if not files:
-            raise RuntimeError("No files on server match mask")
-        latest = pick_latest(files)
-        print(f"[INFO] Latest on server: {latest}")
-        path = download(ftps, latest, LOCAL_PATH)
+        path = download(ftps, REMOTE_DIR, REMOTE_FILE, LOCAL_PATH)
     finally:
         try:
             ftps.quit()
