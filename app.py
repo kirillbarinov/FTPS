@@ -17,15 +17,45 @@ PASV = os.getenv("PASV", "true").lower() == "true"
 DISABLE_TLS_VERIFY = os.getenv("DISABLE_TLS_VERIFY", "true").lower() == "true"
 
 def connect_ftps():
-    ctx = ssl.create_default_context()
+    # Создаём максимально совместимый контекст для старых серверов
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+    # Разрешаем старые версии TLS (если сервер древний)
+    try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1        # включаем TLS 1.0+
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2      # ограничим до 1.2 (обычно хватает)
+    except Exception:
+        pass
+
+    # Снижаем уровень безопасности OpenSSL (для старых шифров)
+    try:
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+    except Exception:
+        pass
+
+    # Разрешаем легаси-коннект (OpenSSL 3)
+    try:
+        ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
+        ctx.options |= ssl.OP_IGNORE_UNEXPECTED_EOF
+    except Exception:
+        pass
+
+    # Проверку сертификата отключаем, если задан DISABLE_TLS_VERIFY=true
     if DISABLE_TLS_VERIFY:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-    ftps = FTP_TLS(context=ctx)
+
+    # Инициируем FTPS (Explicit TLS)
+    ftps = FTP_TLS(context=ctx, timeout=30)
+    # В ряде случаев помогает предварительный TYPE I
     ftps.connect(HOST, PORT, timeout=30)
-    ftps.auth()
+
+    # Явно говорим серверу перейти на TLS
+    ftps.auth()          # AUTH TLS
+
+    # Логинимся и шифруем data-канал
     ftps.login(USER, PASSWORD)
-    ftps.prot_p()
+    ftps.prot_p()        # защищённый data channel
     ftps.set_pasv(PASV)
     ftps.encoding = "utf-8"
     return ftps
