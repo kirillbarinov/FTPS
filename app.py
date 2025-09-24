@@ -4,6 +4,27 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from ftplib import FTP_TLS, error_perm
 
+import socket
+from ftplib import FTP_TLS
+
+class FTPSessionReuse(FTP_TLS):
+    """FTP_TLS с повторным использованием TLS-сессии для data-соединений."""
+    def ntransfercmd(self, cmd, rest=None):
+        # Базовая логика из FTP_TLS, но добавляем session=self.sock.session
+        size = None
+        if self.passiveserver:
+            host, port = self.makepasv()
+            conn = socket.create_connection((host, port), self.timeout, self.source_address)
+            if self._prot_p:
+                conn = self.context.wrap_socket(
+                    conn,
+                    server_hostname=self.host,
+                    session=getattr(self.sock, "session", None)  # <-- ключевая строчка
+                )
+            return conn, size
+        else:
+            raise OSError("Active mode is not supported in this client")
+
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "").strip()
 LOCAL_PATH = Path(os.getenv("LOCAL_PATH", "/data/ostatki.xlsx"))
 HOST     = os.getenv("FTPS_HOST", "195.239.40.222")
@@ -17,48 +38,35 @@ PASV = os.getenv("PASV", "true").lower() == "true"
 DISABLE_TLS_VERIFY = os.getenv("DISABLE_TLS_VERIFY", "true").lower() == "true"
 
 def connect_ftps():
-    # Создаём максимально совместимый контекст для старых серверов
+    # максимально совместимый SSL-контекст
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-
-    # Разрешаем старые версии TLS (если сервер древний)
     try:
-        ctx.minimum_version = ssl.TLSVersion.TLSv1        # включаем TLS 1.0+
-        ctx.maximum_version = ssl.TLSVersion.TLSv1_2      # ограничим до 1.2 (обычно хватает)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
     except Exception:
         pass
-
-    # Снижаем уровень безопасности OpenSSL (для старых шифров)
     try:
         ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
-    except Exception:
-        pass
-
-    # Разрешаем легаси-коннект (OpenSSL 3)
-    try:
         ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
         ctx.options |= ssl.OP_IGNORE_UNEXPECTED_EOF
     except Exception:
         pass
-
-    # Проверку сертификата отключаем, если задан DISABLE_TLS_VERIFY=true
     if DISABLE_TLS_VERIFY:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-    # Инициируем FTPS (Explicit TLS)
-    ftps = FTP_TLS(context=ctx, timeout=30)
-    # В ряде случаев помогает предварительный TYPE I
+    ftps = FTPSessionReuse(context=ctx, timeout=30)   # <-- используем подкласс
     ftps.connect(HOST, PORT, timeout=30)
-
-    # Явно говорим серверу перейти на TLS
-    ftps.auth()          # AUTH TLS
-
-    # Логинимся и шифруем data-канал
+    print("[FTPS] auth()…")
+    ftps.auth()                       # AUTH TLS
+    print("[FTPS] login()…")
     ftps.login(USER, PASSWORD)
-    ftps.prot_p()        # защищённый data channel
-    ftps.set_pasv(PASV)
+    print("[FTPS] prot_p()…")
+    ftps.prot_p()                     # защищаем data-канал
+    ftps.set_pasv(True)
     ftps.encoding = "utf-8"
     return ftps
+
 
 def list_files(ftps):
     ftps.cwd(REMOTE_DIR)
